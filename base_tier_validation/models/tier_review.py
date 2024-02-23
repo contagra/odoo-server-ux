@@ -60,6 +60,9 @@ class TierReview(models.Model):
     approve_sequence = fields.Boolean(
         related="definition_id.approve_sequence", readonly=True
     )
+    approve_sequence_bypass = fields.Boolean(
+        related="definition_id.approve_sequence_bypass", readonly=True
+    )
 
     @api.depends_context("tz")
     def _compute_reviewed_formated_date(self):
@@ -68,9 +71,9 @@ class TierReview(models.Model):
             if not review.reviewed_date:
                 review.reviewed_formated_date = False
                 continue
-            requested_date_utc = pytz.timezone(timezone).localize(review.reviewed_date)
-            requested_date = requested_date_utc.astimezone(pytz.timezone(timezone))
-            review.reviewed_formated_date = requested_date.replace(tzinfo=None)
+            reviewed_date_utc = pytz.timezone("UTC").localize(review.reviewed_date)
+            reviewed_date_tz = reviewed_date_utc.astimezone(pytz.timezone(timezone))
+            review.reviewed_formated_date = reviewed_date_tz.replace(tzinfo=None)
 
     @api.depends("definition_id.approve_sequence")
     def _compute_can_review(self):
