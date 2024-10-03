@@ -1,4 +1,5 @@
 # Copyright 2017-19 ForgeFlow S.L. (https://www.forgeflow.com)
+# Copyright 2024 Moduon Team (https://www.moduon.team)
 # License AGPL-3.0 or later (https://www.gnu.org/licenses/agpl).
 
 from ast import literal_eval
@@ -8,6 +9,8 @@ from lxml import etree
 from odoo import _, api, fields, models
 from odoo.exceptions import ValidationError
 from odoo.tools.misc import frozendict
+
+BASE_EXCEPTION_FIELDS = ["message_follower_ids", "access_token"]
 
 
 class TierValidation(models.AbstractModel):
@@ -233,11 +236,15 @@ class TierValidation(models.AbstractModel):
             if isinstance(rec.id, models.NewId):
                 rec.need_validation = False
                 continue
-            tiers = self.env["tier.definition"].search(
-                [
-                    ("model", "=", self._name),
-                    ("company_id", "in", [False] + self.env.company.ids),
-                ]
+            tiers = (
+                self.env["tier.definition"]
+                .with_context(active_test=True)
+                .search(
+                    [
+                        ("model", "=", self._name),
+                        ("company_id", "in", [False] + self.env.company.ids),
+                    ]
+                )
             )
             valid_tiers = any([rec.evaluate_tier(tier) for tier in tiers])
             rec.need_validation = (
@@ -252,9 +259,46 @@ class TierValidation(models.AbstractModel):
             return self
 
     @api.model
+    def _get_validation_exceptions(self, extra_domain=None, add_base_exceptions=True):
+        """Return Tier Validation Exception field names that matchs custom domain."""
+        exception_fields = (
+            self.env["tier.validation.exception"]
+            .sudo()
+            .search(
+                [
+                    ("model_name", "=", self._name),
+                    ("company_id", "in", [False] + self.env.company.ids),
+                    "|",
+                    ("group_ids", "in", self.env.user.groups_id.ids),
+                    ("group_ids", "=", False),
+                    *(extra_domain or []),
+                ]
+            )
+            .mapped("field_ids.name")
+        )
+        if add_base_exceptions:
+            exception_fields += BASE_EXCEPTION_FIELDS
+        return list(set(exception_fields))
+
+    @api.model
+    def _get_all_validation_exceptions(self):
+        """Extend for more field exceptions to be written when on the entire
+        validation process."""
+        return self._get_validation_exceptions()
+
+    @api.model
     def _get_under_validation_exceptions(self):
-        """Extend for more field exceptions."""
-        return ["message_follower_ids", "access_token"]
+        """Extend for more field exceptions to be written under validation."""
+        return self._get_validation_exceptions(
+            extra_domain=[("allowed_to_write_under_validation", "=", True)]
+        )
+
+    @api.model
+    def _get_after_validation_exceptions(self):
+        """Extend for more field exceptions to be written after validation."""
+        return self._get_validation_exceptions(
+            extra_domain=[("allowed_to_write_after_validation", "=", True)]
+        )
 
     def _check_allow_write_under_validation(self, vals):
         """Allow to add exceptions for fields that are allowed to be written
@@ -264,6 +308,36 @@ class TierValidation(models.AbstractModel):
             if val not in exceptions:
                 return False
         return True
+
+    def _check_allow_write_after_validation(self, vals):
+        """Allow to add exceptions for fields that are allowed to be written
+        even when the record is after validation."""
+        exceptions = self._get_after_validation_exceptions()
+        for val in vals:
+            if val not in exceptions:
+                return False
+        return True
+
+    def _get_fields_to_write_validation(self, vals, records_exception_function):
+        """Not allowed fields to write when validation depending
+        on the given function."""
+        exceptions = records_exception_function()
+        not_allowed_fields = []
+        for val in vals:
+            if val not in exceptions:
+                not_allowed_fields.append(val)
+        if not not_allowed_fields:
+            return []
+
+        not_allowed_field_names, allowed_field_names = [], []
+        for fld_name, fld_data in self.fields_get(
+            not_allowed_fields + exceptions
+        ).items():
+            if fld_name in not_allowed_fields:
+                not_allowed_field_names.append(fld_data["string"])
+            else:
+                allowed_field_names.append(fld_data["string"])
+        return allowed_field_names, not_allowed_field_names
 
     def write(self, vals):
         for rec in self:
@@ -286,6 +360,7 @@ class TierValidation(models.AbstractModel):
                             "one record."
                         )
                     )
+            # Write under validation
             if (
                 rec.review_ids
                 and getattr(rec, self._state_field) in self._state_from
@@ -294,7 +369,50 @@ class TierValidation(models.AbstractModel):
                 and not rec._check_allow_write_under_validation(vals)
                 and not rec._context.get("skip_validation_check")
             ):
-                raise ValidationError(_("The operation is under validation."))
+                (
+                    allowed_fields,
+                    not_allowed_fields,
+                ) = rec._get_fields_to_write_validation(
+                    vals, rec._get_under_validation_exceptions
+                )
+                raise ValidationError(
+                    _(
+                        "You are not allowed to write those fields under validation.\n"
+                        "- %(not_allowed_fields)s\n\n"
+                        "Only those fields can be modified:\n- %(allowed_fields)s"
+                    )
+                    % {
+                        "not_allowed_fields": "\n- ".join(not_allowed_fields),
+                        "allowed_fields": "\n- ".join(allowed_fields),
+                    }
+                )
+
+            # Write after validation. Check only if Tier Validation Exception is created
+            if (
+                rec._get_validation_exceptions(add_base_exceptions=False)
+                and rec.validation_status == "validated"
+                and getattr(rec, self._state_field)
+                in (self._state_to + [self._cancel_state])
+                and not rec._check_allow_write_after_validation(vals)
+                and not rec._context.get("skip_validation_check")
+            ):
+                (
+                    allowed_fields,
+                    not_allowed_fields,
+                ) = rec._get_fields_to_write_validation(
+                    vals, rec._get_after_validation_exceptions
+                )
+                raise ValidationError(
+                    _(
+                        "You are not allowed to write those fields after validation.\n"
+                        "- %(not_allowed_fields)s\n\n"
+                        "Only those fields can be modified:\n- %(allowed_fields)s"
+                    )
+                    % {
+                        "not_allowed_fields": "\n- ".join(not_allowed_fields),
+                        "allowed_fields": "\n- ".join(allowed_fields),
+                    }
+                )
             if rec._allow_to_remove_reviews(vals):
                 rec.mapped("review_ids").unlink()
         return super().write(vals)
@@ -422,7 +540,10 @@ class TierValidation(models.AbstractModel):
             lambda x: x.sequence in sequences or x.approve_sequence_bypass
         )
         if self.has_comment:
-            return self._add_comment("validate", reviews)
+            user_reviews = reviews.filtered(
+                lambda r: r.status == "pending" and (self.env.user in r.reviewer_ids)
+            )
+            return self._add_comment("validate", user_reviews)
         self._validate_tier(reviews)
         self._update_counter({"review_deleted": True})
 
@@ -622,19 +743,17 @@ class TierValidation(models.AbstractModel):
         new_node = etree.fromstring(str_element)
         return new_node
 
+    def _get_tier_validation_readonly_domain(self):
+        return "bool(review_ids)"
+
     @api.model
     def get_view(self, view_id=None, view_type="form", **options):
         res = super().get_view(view_id=view_id, view_type=view_type, **options)
-
         View = self.env["ir.ui.view"]
-
-        # Override context for postprocessing
-        if view_id and res.get("base_model", self._name) != self._name:
-            View = View.with_context(base_model_name=res["base_model"])
         if view_type == "form" and not self._tier_validation_manual_config:
             doc = etree.XML(res["arch"])
             params = {}
-            all_models = res["models"].copy()
+            all_models = res["models"].copy()  # {modelname(str) ➔ fields(tuple)}
             for node in doc.xpath(self._tier_validation_buttons_xpath):
                 # By default, after the last button of the header
                 # _add_tier_validation_buttons process
@@ -643,6 +762,7 @@ class TierValidation(models.AbstractModel):
                 new_node = etree.fromstring(new_arch)
                 for new_element in new_node:
                     node.addnext(new_element)
+                _merge_view_fields(all_models, new_models)
             for node in doc.xpath("/form/sheet"):
                 # _add_tier_validation_label process
                 new_node = self._add_tier_validation_label(node, params)
@@ -650,18 +770,22 @@ class TierValidation(models.AbstractModel):
                 new_node = etree.fromstring(new_arch)
                 for new_element in new_node:
                     node.addprevious(new_element)
+                _merge_view_fields(all_models, new_models)
                 # _add_tier_validation_reviews process
                 new_node = self._add_tier_validation_reviews(node, params)
                 new_arch, new_models = View.postprocess_and_fields(new_node, self._name)
-                for model in new_models:
-                    if model in all_models:
-                        continue
-                    if model not in res["models"]:
-                        all_models[model] = new_models[model]
-                    else:
-                        all_models[model] = res["models"][model]
                 new_node = etree.fromstring(new_arch)
                 node.append(new_node)
+                _merge_view_fields(all_models, new_models)
+            excepted_fields = self._get_all_validation_exceptions()
+            for node in doc.xpath("//field[@name][not(ancestor::field)]"):
+                if node.attrib.get("name") in excepted_fields:
+                    continue
+                new_r_modifier = self._get_tier_validation_readonly_domain()
+                old_r_modifier = node.attrib.get("readonly")
+                if old_r_modifier:
+                    new_r_modifier = f"({old_r_modifier}) or ({new_r_modifier})"
+                node.attrib["readonly"] = new_r_modifier
             res["arch"] = etree.tostring(doc)
             res["models"] = frozendict(all_models)
         return res
@@ -684,3 +808,12 @@ class TierValidation(models.AbstractModel):
                     subtype_xmlid=self._get_requested_notification_subtype(),
                     body=rec._notify_requested_review_body(),
                 )
+
+
+def _merge_view_fields(all_models: dict, new_models: dict):
+    """Merge new_models into all_models. Both are {modelname(str) ➔ fields(tuple)}."""
+    for model, view_fields in new_models.items():
+        if model in all_models:
+            all_models[model] = tuple(set(all_models[model]) | set(view_fields))
+        else:
+            all_models[model] = tuple(view_fields)
